@@ -2,5 +2,12 @@
   "name": "random-mcp",
   "main": "src/server.ts",
   "compatibility_date": "2026-06-11",
-  "compatibility_flags": ["nodejs_compat"]
+  "compatibility_flags": ["nodejs_compat"],
+  // öffentliche Adresse https://random-mcp.<konto>.workers.dev einschalten
+  "workers_dev": true,
+  // Protokoll (console.log) im Dashboard unter "Logs" speichern
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
 }
