@@ -119,9 +119,15 @@ function aufrufer(request: Request): Aufrufer {
   };
 }
 
-function protokoll(eintrag: Record<string, unknown>) {
-  console.log(JSON.stringify({ zeit: new Date().toISOString(), ...eintrag }));
+/** Ein Protokolleintrag. `message` erscheint im Cloudflare-Dashboard in der Spalte "Message". */
+function protokoll(message: string, eintrag: Record<string, unknown>) {
+  console.log(JSON.stringify({ message, zeit: new Date().toISOString(), ...eintrag }));
 }
+
+const kurz = (wert: unknown) => {
+  const text = JSON.stringify(wert);
+  return text.length > 120 ? text.slice(0, 117) + "..." : text;
+};
 
 /** Werkzeug ausführen und Aufruf + Ergebnis (oder Fehler) protokollieren. */
 function ausfuehren(
@@ -136,11 +142,14 @@ function ausfuehren(
       ...(WERKZEUGE[name] as (p: any) => Ergebnis)(eingabe),
       quelle: QUELLE
     };
-    protokoll({ typ: "werkzeug", kanal, werkzeug: name, eingabe, ergebnis, dauer_ms: Date.now() - start, ...wer });
+    const { quelle: _q, ...nurErgebnis } = ergebnis;
+    protokoll(`[${kanal}] ${name} ${kurz(eingabe)} → ${kurz(nurErgebnis)}`,
+      { typ: "werkzeug", kanal, werkzeug: name, eingabe, ergebnis, dauer_ms: Date.now() - start, ...wer });
     return ergebnis;
   } catch (e) {
     const fehler = e instanceof Error ? e.message : String(e);
-    protokoll({ typ: "werkzeug", kanal, werkzeug: name, eingabe, fehler, dauer_ms: Date.now() - start, ...wer });
+    protokoll(`[${kanal}] ${name} ${kurz(eingabe)} → FEHLER: ${fehler}`,
+      { typ: "werkzeug", kanal, werkzeug: name, eingabe, fehler, dauer_ms: Date.now() - start, ...wer });
     throw e;
   }
 }
@@ -148,14 +157,15 @@ function ausfuehren(
 /** MCP-Anfragen (JSON-RPC) protokollieren: welche Methode, welcher Client. */
 async function protokolliereMcpAnfrage(request: Request, wer: Aufrufer) {
   if (request.method !== "POST") {
-    protokoll({ typ: "mcp-anfrage", http: request.method, ...wer });
+    protokoll(`[mcp] HTTP ${request.method}`, { typ: "mcp-anfrage", http: request.method, ...wer });
     return;
   }
   try {
     const body = await request.clone().json();
     for (const nachricht of Array.isArray(body) ? body : [body]) {
       const p = nachricht?.params ?? {};
-      protokoll({
+      const client = p.clientInfo ? ` von ${p.clientInfo.name} ${p.clientInfo.version ?? ""}`.trimEnd() : "";
+      protokoll(`[mcp] ${nachricht?.method ?? "?"}${p.name ? " " + p.name : ""}${client}`, {
         typ: "mcp-anfrage",
         methode: nachricht?.method,
         werkzeug: p.name,
@@ -165,7 +175,7 @@ async function protokolliereMcpAnfrage(request: Request, wer: Aufrufer) {
       });
     }
   } catch {
-    protokoll({ typ: "mcp-anfrage", hinweis: "Body nicht lesbar", ...wer });
+    protokoll("[mcp] Anfrage nicht lesbar", { typ: "mcp-anfrage", hinweis: "Body nicht lesbar", ...wer });
   }
 }
 
