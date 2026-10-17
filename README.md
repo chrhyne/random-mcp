@@ -39,6 +39,29 @@ Alle Aufrufe sind `GET`, die Antwort ist JSON. Listen werden kommagetrennt über
 
 `/api` listet alle Werkzeuge. Fehler kommen mit Status 400 und Feld `fehler` zurück.
 
+## Demo: langsamer Dienst (~30 Sekunden)
+
+Zeigt, wie man Nutzer bei langen Wartezeiten bei Laune hält – komplett mit MCP. Die Zufallszahl selbst ist echt,
+nur die Wartezeit ist gespielt.
+
+| Werkzeug | Muster | Was passiert |
+|---|---|---|
+| `langsame_zufallszahl` | blockierend | Aufruf dauert `dauer_sekunden` (Standard 30, max. 60); der Server schickt dabei jede Sekunde-ish eine MCP-Fortschrittsmeldung (`notifications/progress`) mit Prozent und Text |
+| `auftrag_starten` | Auftrag | antwortet sofort mit `auftrag_id` und geschätzter Dauer (bis 180 s) |
+| `auftrag_status` | Auftrag | liefert Fortschritt + Statustext oder das Ergebnis; mit `warten_sekunden` (bis 20) wartet der Server erst und schickt währenddessen Fortschrittsmeldungen |
+
+**Wann welches Muster?**
+- Fortschrittsmeldungen zeigt nicht jeder Client an, und manche brechen lange Aufrufe ab. Das blockierende Muster
+  ist daher gut zum Vorführen, aber riskant im Alltag.
+- Das Auftragsmuster funktioniert mit jedem Client: Das LLM sagt dem Nutzer die Dauer, fragt in Abständen nach und
+  schreibt zwischendurch Zwischenmeldungen – der Nutzer sieht so die ganze Zeit, dass etwas passiert.
+
+REST: `/api/auftrag_starten?minimum=1&maximum=100&dauer_sekunden=30` → `/api/auftrag_status?id=<auftrag_id>`.
+Auf der Demo-Seite gibt es dafür den Knopf „🐢 Langsamer Dienst“ mit Fortschrittsbalken.
+
+Technik: Ohne Datenbank – Startzeit, Bereich und eine zufällige Kennung stecken in der Auftrags-ID, das Ergebnis wird
+daraus abgeleitet (für eine Demo okay; wer die ID kennt, könnte das Ergebnis vorab ausrechnen).
+
 ## Protokoll / Debugging
 
 Jeder Aufruf wird als JSON-Zeile protokolliert:
@@ -82,10 +105,12 @@ Lokal testen: `npm run dev` → `http://localhost:8787/mcp`.
 
 - [x] **Stufe 1:** Cloudflare-Zufall (`crypto.getRandomValues`), 5 Werkzeuge, öffentlich über Cloudflare Worker
 - [x] REST-API, Demo-Seite und Protokoll aller Aufrufe
+- [x] Demo „langsamer Dienst“: Fortschrittsmeldungen und Auftragsmuster
 - [ ] **Stufe 2: random.org als Quelle** (atmosphärisches Rauschen)
   - kostenloser Developer-Schlüssel von api.random.org (max. 1.000 Anfragen/Tag, für Entwicklung/Test gedacht)
   - Schlüssel als Cloudflare-Secret hinterlegen (`RANDOM_ORG_API_KEY`), nicht im Code
   - Parameter `quelle` für die Werkzeuge; automatischer Rückfall auf Cloudflare-Zufall bei Fehler oder leerem Kontingent
+- [ ] Vorrat (Pool) für langsame Quellen: im Hintergrund per Cron auffüllen, Aufrufe antworten sofort
 - [ ] Ideen für später
   - Zugriffsschutz (der Endpunkt ist bisher ohne Anmeldung erreichbar)
   - weitere Werkzeuge, z. B. Passwort- oder Namensgenerator, Teams auslosen, Glücksrad

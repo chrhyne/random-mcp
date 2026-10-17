@@ -179,10 +179,109 @@ async function protokolliereMcpAnfrage(request: Request, wer: Aufrufer) {
   }
 }
 
+// ------------------------------------------------------------ Langsamer Fake-Dienst (Demo)
+//
+// Simuliert eine Zufallsquelle, die ~30 Sekunden braucht – um zu zeigen,
+// wie man Nutzer bei langen Wartezeiten informiert. Zwei Muster:
+//
+//  A) Blockierend: `langsame_zufallszahl` wartet selbst und schickt währenddessen
+//     MCP-Fortschrittsmeldungen (notifications/progress) und Log-Meldungen.
+//  B) Auftrag: `auftrag_starten` antwortet sofort mit einer Auftrags-ID,
+//     `auftrag_status` liefert Fortschritt bzw. Ergebnis.
+//     Ohne Datenbank: Startzeit und Bereich stecken in der Auftrags-ID,
+//     das Ergebnis wird aus der (zufälligen) ID abgeleitet.
+
+const PHASEN = [
+  "Verbinde mit der (erfundenen) Rauschquelle …",
+  "Sammle Hintergrundrauschen …",
+  "Filtere Störsignale heraus …",
+  "Mische die Bits gründlich durch …",
+  "Prüfe die Gleichverteilung …",
+  "Fast fertig, poliere die Zahl …"
+];
+
+const phase = (anteil: number) =>
+  PHASEN[Math.min(PHASEN.length - 1, Math.floor(anteil * PHASEN.length))];
+
+const schlafe = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((ok, abbruch) => {
+    const t = setTimeout(ok, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      abbruch(new Error("Aufruf wurde abgebrochen"));
+    });
+  });
+
+interface Auftrag {
+  s: number; // Startzeit (ms)
+  d: number; // Dauer (s)
+  min: number;
+  max: number;
+  n: string; // zufällige Kennung
+}
+
+const b64url = (text: string) =>
+  btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const vonB64url = (text: string) => atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+
+function neuerAuftrag(min: number, max: number, dauer: number): string {
+  if (min > max) throw new Error("minimum darf nicht größer als maximum sein");
+  const n = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
+  return b64url(JSON.stringify({ s: Date.now(), d: dauer, min, max, n } satisfies Auftrag));
+}
+
+function leseAuftrag(id: string): Auftrag {
+  try {
+    const a = JSON.parse(vonB64url(id)) as Auftrag;
+    if (typeof a.s === "number" && typeof a.n === "string") return a;
+  } catch {}
+  throw new Error("Unbekannte oder ungültige Auftrags-ID");
+}
+
+/** Ergebnis aus der zufälligen Auftrags-Kennung ableiten (gleichverteilt, Rejection Sampling). */
+async function auftragsErgebnis(a: Auftrag): Promise<number> {
+  const spanne = a.max - a.min + 1;
+  const grenze = Math.floor(2 ** 32 / spanne) * spanne;
+  for (let runde = 0; ; runde++) {
+    const hash = new DataView(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${a.n}:${runde}`))
+    );
+    for (let i = 0; i < 32; i += 4) {
+      const wert = hash.getUint32(i);
+      if (wert < grenze) return a.min + (wert % spanne);
+    }
+  }
+}
+
+async function auftragsStatus(id: string) {
+  const a = leseAuftrag(id);
+  const vergangen = (Date.now() - a.s) / 1000;
+  const anteil = Math.min(1, vergangen / a.d);
+  if (anteil < 1) {
+    return {
+      status: "laeuft",
+      fortschritt_prozent: Math.floor(anteil * 100),
+      meldung: phase(anteil),
+      restzeit_sekunden: Math.ceil(a.d - vergangen),
+      auftrag_id: id
+    };
+  }
+  return {
+    status: "fertig",
+    fortschritt_prozent: 100,
+    zahl: await auftragsErgebnis(a),
+    bereich: [a.min, a.max],
+    auftrag_id: id,
+    quelle: "fake-langsam (Demo, abgeleitet aus Cloudflare-Zufall)"
+  };
+}
+
 // ------------------------------------------------------------ MCP
 
 function createServer(wer: Aufrufer) {
-  const server = new McpServer({ name: "random-mcp", version: "1.1.0" });
+  const server = new McpServer({ name: "random-mcp", version: "1.2.0" });
 
   const registriere = (
     name: WerkzeugName,
@@ -224,6 +323,109 @@ function createServer(wer: Aufrufer) {
     "mischen",
     "Bringt eine Liste in eine zufällige Reihenfolge (z. B. Spielreihenfolge, Karten).",
     { elemente: z.array(z.string()).min(1) }
+  );
+
+  // ---------------- Muster A: blockierend mit Fortschrittsmeldungen
+  server.registerTool(
+    "langsame_zufallszahl",
+    {
+      description:
+        "DEMO eines langsamen Dienstes: erzeugt EINE Zufallszahl, braucht aber ca. `dauer_sekunden` (Standard 30). " +
+        "Sendet währenddessen Fortschrittsmeldungen. Sage dem Nutzer VOR dem Aufruf, dass es etwa so lange dauert.",
+      inputSchema: {
+        minimum: z.number().int().default(1),
+        maximum: z.number().int().default(100),
+        dauer_sekunden: z.number().int().min(5).max(60).default(30)
+      }
+    },
+    async ({ minimum, maximum, dauer_sekunden }, ctx) => {
+      const start = Date.now();
+      const token = ctx.mcpReq._meta?.progressToken;
+      const schritte = 10;
+      protokoll(`[mcp] langsame_zufallszahl gestartet (${dauer_sekunden}s, Fortschritt ${token !== undefined ? "an" : "aus"})`,
+        { typ: "langsam", eingabe: { minimum, maximum, dauer_sekunden }, fortschritt_token: token ?? null, ...wer });
+
+      for (let i = 0; i < schritte; i++) {
+        const meldung = phase(i / schritte);
+        if (token !== undefined) {
+          await ctx.mcpReq.notify({
+            method: "notifications/progress",
+            params: { progressToken: token, progress: i, total: schritte, message: meldung }
+          }).catch(() => {});
+        }
+        await schlafe((dauer_sekunden * 1000) / schritte, ctx.mcpReq.signal);
+      }
+
+      const zahl = zufallsInts(1, minimum, maximum)[0];
+      const ergebnis = { zahl, dauer_sekunden: Math.round((Date.now() - start) / 1000), quelle: "fake-langsam (Demo, Cloudflare-Zufall)" };
+      protokoll(`[mcp] langsame_zufallszahl → ${zahl} nach ${ergebnis.dauer_sekunden}s`,
+        { typ: "langsam", ergebnis, ...wer });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }],
+        structuredContent: ergebnis
+      };
+    }
+  );
+
+  // ---------------- Muster B: Auftrag starten + Status abfragen
+  server.registerTool(
+    "auftrag_starten",
+    {
+      description:
+        "DEMO eines langsamen Dienstes als Auftrag: startet die Erzeugung EINER Zufallszahl, die ca. `dauer_sekunden` " +
+        "(Standard 30) braucht, und antwortet SOFORT mit einer auftrag_id. Sage dem Nutzer die geschätzte Dauer. " +
+        "Hole danach das Ergebnis mit `auftrag_status` ab.",
+      inputSchema: {
+        minimum: z.number().int().default(1),
+        maximum: z.number().int().default(100),
+        dauer_sekunden: z.number().int().min(5).max(180).default(30)
+      }
+    },
+    async ({ minimum, maximum, dauer_sekunden }) => {
+      const auftrag_id = neuerAuftrag(minimum, maximum, dauer_sekunden);
+      const ergebnis = {
+        auftrag_id,
+        status: "gestartet",
+        geschaetzte_dauer_sekunden: dauer_sekunden,
+        naechster_schritt: "auftrag_status mit dieser auftrag_id aufrufen (z. B. mit warten_sekunden=10)"
+      };
+      protokoll(`[mcp] auftrag_starten (${minimum}–${maximum}, ${dauer_sekunden}s)`,
+        { typ: "auftrag", eingabe: { minimum, maximum, dauer_sekunden }, auftrag_id, ...wer });
+      return { content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }], structuredContent: ergebnis };
+    }
+  );
+
+  server.registerTool(
+    "auftrag_status",
+    {
+      description:
+        "Fragt den Stand eines mit `auftrag_starten` gestarteten Auftrags ab. Mit `warten_sekunden` (bis 20) wartet der " +
+        "Server erst und meldet dann den Stand – so musst du nicht ständig fragen. Solange status='laeuft': schreibe dem " +
+        "Nutzer eine kurze Zwischenmeldung (Fortschritt + meldung) und frage erneut. Bei status='fertig' steht das Ergebnis in `zahl`.",
+      inputSchema: {
+        auftrag_id: z.string().min(1),
+        warten_sekunden: z.number().int().min(0).max(20).default(10)
+      }
+    },
+    async ({ auftrag_id, warten_sekunden }, ctx) => {
+      const a = leseAuftrag(auftrag_id);
+      const token = ctx.mcpReq._meta?.progressToken;
+      const ende = Math.min(Date.now() + warten_sekunden * 1000, a.s + a.d * 1000);
+      while (Date.now() < ende) {
+        if (token !== undefined) {
+          const anteil = Math.min(1, (Date.now() - a.s) / 1000 / a.d);
+          await ctx.mcpReq.notify({
+            method: "notifications/progress",
+            params: { progressToken: token, progress: Math.floor(anteil * 100), total: 100, message: phase(anteil) }
+          }).catch(() => {});
+        }
+        await schlafe(Math.min(2000, Math.max(0, ende - Date.now())), ctx.mcpReq.signal);
+      }
+      const ergebnis = await auftragsStatus(auftrag_id);
+      protokoll(`[mcp] auftrag_status → ${ergebnis.status === "fertig" ? `fertig: ${ergebnis.zahl}` : `${ergebnis.fortschritt_prozent} % (${ergebnis.meldung})`}`,
+        { typ: "auftrag", ergebnis, ...wer });
+      return { content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }], structuredContent: ergebnis };
+    }
   );
 
   return server;
@@ -313,11 +515,28 @@ button:hover{border-color:var(--accent)}button b{display:block}button span{color
 <button data-u="/api/auswaehlen?optionen=Ida,Adrian,Papa"><b>👆 Wer fängt an?</b><span>/api/auswaehlen?optionen=…</span></button>
 <button data-u="/api/mischen?elemente=Rot,Blau,Gelb,Gr%C3%BCn"><b>🔀 Reihenfolge</b><span>/api/mischen?elemente=…</span></button>
 <button data-u="/api/wuerfeln?seiten=20"><b>🐉 W20</b><span>/api/wuerfeln?seiten=20</span></button>
+<button id="langsam"><b>🐢 Langsamer Dienst (30 s)</b><span>/api/auftrag_starten → /api/auftrag_status</span></button>
 </div>
+<div class="out" id="fortschritt" hidden><div class="url"></div>
+<div style="height:10px;background:var(--line);border-radius:5px;margin:12px 0 8px;overflow:hidden"><div id="balken" style="height:100%;width:0;background:var(--accent);transition:width .8s"></div></div>
+<pre id="fmeldung"></pre></div>
 <div class="out" hidden><div class="url"></div><pre></pre></div>
 </main><script>
 const out=document.querySelector('.out');
-document.querySelectorAll('button').forEach(b=>b.onclick=async()=>{
+const fb=document.getElementById('fortschritt'),balken=document.getElementById('balken'),fm=document.getElementById('fmeldung');
+document.getElementById('langsam').onclick=async()=>{
+  fb.hidden=false;balken.style.width='0';fm.textContent='Starte Auftrag …';
+  const s=await (await fetch('/api/auftrag_starten?minimum=1&maximum=100')).json();
+  fb.querySelector('.url').textContent='Auftrag gestartet – geschätzte Dauer '+s.geschaetzte_dauer_sekunden+' s';
+  while(true){
+    const r=await (await fetch('/api/auftrag_status?id='+s.auftrag_id)).json();
+    balken.style.width=r.fortschritt_prozent+'%';
+    if(r.status==='fertig'){fm.textContent='🎉 Ergebnis: '+r.zahl+'\\n\\n'+JSON.stringify(r,null,2);break}
+    fm.textContent=r.fortschritt_prozent+' % – '+r.meldung+' (noch ca. '+r.restzeit_sekunden+' s)';
+    await new Promise(x=>setTimeout(x,1000));
+  }
+};
+document.querySelectorAll('button[data-u]').forEach(b=>b.onclick=async()=>{
   const u=b.dataset.u;out.hidden=false;out.querySelector('.url').textContent='GET '+location.origin+u;
   const pre=out.querySelector('pre');pre.textContent='…';
   try{const r=await fetch(u);pre.textContent=JSON.stringify(await r.json(),null,2)}catch(e){pre.textContent='Fehler: '+e}
@@ -337,7 +556,7 @@ export default {
 
     if (url.pathname === "/api" || url.pathname === "/api/") {
       return json({
-        werkzeuge: Object.keys(WERKZEUGE),
+        werkzeuge: [...Object.keys(WERKZEUGE), "auftrag_starten", "auftrag_status"],
         beispiel: `${url.origin}/api/wuerfeln?anzahl=2&seiten=6`
       });
     }
@@ -346,7 +565,23 @@ export default {
       if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
       if (request.method !== "GET") return json({ fehler: "Nur GET wird unterstützt" }, 405);
       try {
-        return restAufruf(url.pathname.slice(5), url.searchParams, wer);
+        const name = url.pathname.slice(5);
+        const q = url.searchParams;
+        if (name === "auftrag_starten") {
+          const dauer = zahl(q, "dauer_sekunden", 30);
+          if (dauer < 5 || dauer > 180) throw new Error("dauer_sekunden muss zwischen 5 und 180 liegen");
+          const auftrag_id = neuerAuftrag(zahl(q, "minimum", 1), zahl(q, "maximum", 100), dauer);
+          protokoll(`[rest] auftrag_starten (${dauer}s)`, { typ: "auftrag", kanal: "rest", auftrag_id, ...wer });
+          return json({ auftrag_id, status: "gestartet", geschaetzte_dauer_sekunden: dauer,
+            status_url: `${url.origin}/api/auftrag_status?id=${auftrag_id}` });
+        }
+        if (name === "auftrag_status") {
+          const ergebnis = await auftragsStatus(q.get("id") ?? "");
+          if (ergebnis.status === "fertig")
+            protokoll(`[rest] auftrag_status → fertig: ${ergebnis.zahl}`, { typ: "auftrag", kanal: "rest", ergebnis, ...wer });
+          return json(ergebnis);
+        }
+        return restAufruf(name, q, wer);
       } catch (e) {
         return json({ fehler: e instanceof Error ? e.message : String(e) }, 400);
       }
