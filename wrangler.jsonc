@@ -5,9 +5,14 @@
   "compatibility_flags": ["nodejs_compat"],
   // öffentliche Adresse https://random-mcp.<konto>.workers.dev einschalten
   "workers_dev": true,
-  // Protokoll (console.log) im Dashboard unter "Logs" speichern
+  // Protokoll: eigene console.log-Einträge + automatische Aufruf-Logs im Dashboard speichern
   "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false
+    }
   }
 }
