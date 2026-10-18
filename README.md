@@ -25,9 +25,55 @@ Jede Antwort enthält das Feld `quelle`, damit Claude sagen kann, woher die Zahl
 gespeist aus Hardware-Entropie. Zahlen in einem Bereich werden per Rejection Sampling gezogen (keine Verzerrung),
 Listen per Fisher-Yates gemischt.
 
+## Anmeldung (Google) und Freigaben
+
+Seit Version 2 ist alles nur noch für **freigegebene Google-Konten** erreichbar:
+
+- **MCP** (`/mcp`) nutzt OAuth 2.1: Beim Verbinden öffnet der Client (z. B. Claude) ein Fenster, man bestätigt den
+  Zugriff, meldet sich mit Google an und bekommt ein Token. Danach läuft alles ohne erneute Anmeldung.
+- **Demo-Seite und REST** verlangen eine Google-Anmeldung im Browser (Sitzung 7 Tage, `/logout` meldet ab).
+
+Prinzip: **Google sagt, wer jemand ist (Authentifizierung), der Worker entscheidet, ob er darf (Autorisierung)**.
+Die Freigabeliste wird beim Anmelden *und* bei jedem Aufruf geprüft – wer gestrichen wird, ist sofort draußen.
+Im Protokoll steht jetzt zu jedem Aufruf die E-Mail-Adresse (`nutzer`), dazu `[auth] angemeldet/abgelehnt: …`.
+
+Code: `src/auth.ts` (Zustimmungsseite, Google-Anmeldung, Freigabeliste, Browser-Sitzung).
+
+### Einrichtung
+
+**1. Google-OAuth-Client anlegen** – [console.cloud.google.com](https://console.cloud.google.com)
+1. Neues Projekt anlegen, z. B. „random-mcp“.
+2. *Google Auth Platform* (früher „OAuth-Zustimmungsbildschirm“) öffnen und einrichten: App-Name „random-mcp“,
+   Support-E-Mail, Zielgruppe **Extern**. Unter *Zielgruppe* bleibt die App im Status **Testing**; dort
+   `stratze@gmail.com` als **Testnutzer** eintragen.
+3. *Clients* → *Client erstellen* → Typ **Webanwendung**. Unter *Autorisierte Weiterleitungs-URIs* beide eintragen:
+   - `https://random-mcp.stratze.workers.dev/callback` (für MCP-Clients)
+   - `https://random-mcp.stratze.workers.dev/login/callback` (für den Browser)
+4. Client-ID und Clientschlüssel kopieren.
+
+**2. Secrets in Cloudflare hinterlegen** – Worker `random-mcp` → *Settings* → *Variables and Secrets* → *Add*,
+jeweils Typ **Secret**:
+
+| Name | Wert |
+|---|---|
+| `GOOGLE_CLIENT_ID` | Client-ID aus Schritt 1 |
+| `GOOGLE_CLIENT_SECRET` | Clientschlüssel aus Schritt 1 |
+| `ERLAUBTE_NUTZER` | `stratze@gmail.com` (mehrere kommagetrennt) |
+
+Solange eins fehlt, kommt niemand rein (die Seiten sagen dann, was fehlt). Den Speicher für Anmeldedaten
+(KV `OAUTH_KV`) legt Cloudflare beim Deploy automatisch an.
+
+**3. Connector neu verbinden** – in Claude den bisherigen Connector entfernen und mit derselben URL neu
+hinzufügen. Die Anmeldung wird automatisch erkannt; „Sign in now“ wählen.
+
+**Freigaben ändern:** nur das Secret `ERLAUBTE_NUTZER` bearbeiten – kein Code, kein Neuverbinden nötig.
+(Solange die Google-App im Status „Testing“ ist, muss ein neues Konto zusätzlich dort als Testnutzer stehen.)
+
+Lokal testen: Datei `.dev.vars` mit den drei Werten anlegen (wird nicht eingecheckt), dann `npm run dev`.
+
 ## REST-API
 
-Alle Aufrufe sind `GET`, die Antwort ist JSON. Listen werden kommagetrennt übergeben.
+Alle Aufrufe sind `GET`, die Antwort ist JSON. Nötig ist eine Browser-Anmeldung (sonst `401` mit Hinweis auf `/login`). Listen werden kommagetrennt übergeben.
 
 | Aufruf | Parameter (Standard) |
 |---|---|
@@ -75,14 +121,14 @@ Zu jedem Eintrag: Zeit, Anfrage-ID (Cloudflare-Ray-ID), IP, Land, Stadt und User
 **Ansehen:** Cloudflare-Dashboard → *Workers & Pages* → `random-mcp` → *Logs* (gespeichert, filterbar).
 Live mitlesen: `npx wrangler tail random-mcp`.
 
-**Hinweis zum „Wer“:** Ruft Claude über einen Connector auf, kommt die Anfrage von Anthropics Servern –
-IP und User-Agent zeigen also „Claude“, nicht den einzelnen Menschen. Wer genau dahinter steckt, lässt sich
-erst mit einem Zugriffsschutz (Roadmap) unterscheiden.
+**Zum „Wer“:** Ruft Claude über einen Connector auf, kommt die Anfrage von Anthropics Servern – IP und
+User-Agent zeigen also „Claude“. Wer dahinter steckt, steht im Feld `nutzer` (die angemeldete Google-Adresse).
 
 ## Projektaufbau
 
 ```
-src/server.ts     der komplette Server (Zufallskern, Werkzeuge, MCP, REST, Demo-Seite, Protokoll)
+src/server.ts     Zufallskern, Werkzeuge, MCP, REST, Demo-Seite, Protokoll
+src/auth.ts       Anmeldung (OAuth/Google), Freigabeliste, Browser-Sitzung
 wrangler.jsonc    Cloudflare-Konfiguration (Name des Workers)
 package.json      Abhängigkeiten
 ```
@@ -106,12 +152,12 @@ Lokal testen: `npm run dev` → `http://localhost:8787/mcp`.
 - [x] **Stufe 1:** Cloudflare-Zufall (`crypto.getRandomValues`), 5 Werkzeuge, öffentlich über Cloudflare Worker
 - [x] REST-API, Demo-Seite und Protokoll aller Aufrufe
 - [x] Demo „langsamer Dienst“: Fortschrittsmeldungen und Auftragsmuster
+- [x] Zugriffsschutz: Google-Anmeldung (OAuth 2.1 für MCP, Sitzung für Browser) mit Freigabeliste
 - [ ] **Stufe 2: random.org als Quelle** (atmosphärisches Rauschen)
   - kostenloser Developer-Schlüssel von api.random.org (max. 1.000 Anfragen/Tag, für Entwicklung/Test gedacht)
   - Schlüssel als Cloudflare-Secret hinterlegen (`RANDOM_ORG_API_KEY`), nicht im Code
   - Parameter `quelle` für die Werkzeuge; automatischer Rückfall auf Cloudflare-Zufall bei Fehler oder leerem Kontingent
 - [ ] Vorrat (Pool) für langsame Quellen: im Hintergrund per Cron auffüllen, Aufrufe antworten sofort
 - [ ] Ideen für später
-  - Zugriffsschutz (der Endpunkt ist bisher ohne Anmeldung erreichbar)
   - weitere Werkzeuge, z. B. Passwort- oder Namensgenerator, Teams auslosen, Glücksrad
   - Quantenzufall (ANU) als weitere Quelle prüfen

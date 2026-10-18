@@ -2,7 +2,9 @@
   "name": "random-mcp",
   "main": "src/server.ts",
   "compatibility_date": "2026-06-11",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  // Speicher für Anmeldedaten (Tokens nur als Hash). Ohne "id" legt Cloudflare den Speicher beim Deploy automatisch an.
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   // öffentliche Adresse https://random-mcp.<konto>.workers.dev einschalten
   "workers_dev": true,
   // Protokoll: eigene console.log-Einträge + automatische Aufruf-Logs im Dashboard speichern

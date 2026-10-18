@@ -8,9 +8,10 @@
  * Kryptografisch sicherer Zufall aus der Hardware-Entropie der Cloudflare-Server.
  *
  * Endpunkte:
- *   /            Demo-Seite im Browser
- *   /mcp         MCP-Endpunkt für Claude & Co.
- *   /api/...     REST-API (GET, Antwort als JSON), siehe README
+ *   /            Demo-Seite im Browser (nach Google-Anmeldung)
+ *   /mcp         MCP-Endpunkt für Claude & Co. (OAuth 2.1, nur freigegebene Konten)
+ *   /api/...     REST-API (GET, JSON; nach Google-Anmeldung im Browser), siehe README
+ *   /login, /authorize, /callback, /token, /register   Anmeldung, siehe src/auth.ts
  *
  * Protokoll: Jeder Aufruf wird als JSON-Zeile per console.log geschrieben
  * und ist im Cloudflare-Dashboard unter Workers → random-mcp → Logs zu sehen
@@ -23,6 +24,11 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/server";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import {
+  authorize, callback, istErlaubt, login, loginCallback, loginSeite, logout, webNutzer,
+  type Env, type Nutzer
+} from "./auth";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
@@ -102,16 +108,18 @@ type WerkzeugName = keyof typeof WERKZEUGE;
 /** Informationen über den Aufrufer, aus der HTTP-Anfrage. */
 interface Aufrufer {
   anfrage_id: string;
+  nutzer: string | null; // angemeldete E-Mail-Adresse
   ip: string | null;
   land: string | null;
   stadt: string | null;
   user_agent: string | null;
 }
 
-function aufrufer(request: Request): Aufrufer {
+function aufrufer(request: Request, nutzer: string | null = null): Aufrufer {
   const cf = (request as { cf?: Record<string, unknown> }).cf ?? {};
   return {
     anfrage_id: request.headers.get("cf-ray") ?? crypto.randomUUID(),
+    nutzer,
     ip: request.headers.get("cf-connecting-ip"),
     land: (cf.country as string) ?? null,
     stadt: (cf.city as string) ?? null,
@@ -143,12 +151,12 @@ function ausfuehren(
       quelle: QUELLE
     };
     const { quelle: _q, ...nurErgebnis } = ergebnis;
-    protokoll(`[${kanal}] ${name} ${kurz(eingabe)} → ${kurz(nurErgebnis)}`,
+    protokoll(`[${kanal}] ${wer.nutzer ?? "?"}: ${name} ${kurz(eingabe)} → ${kurz(nurErgebnis)}`,
       { typ: "werkzeug", kanal, werkzeug: name, eingabe, ergebnis, dauer_ms: Date.now() - start, ...wer });
     return ergebnis;
   } catch (e) {
     const fehler = e instanceof Error ? e.message : String(e);
-    protokoll(`[${kanal}] ${name} ${kurz(eingabe)} → FEHLER: ${fehler}`,
+    protokoll(`[${kanal}] ${wer.nutzer ?? "?"}: ${name} ${kurz(eingabe)} → FEHLER: ${fehler}`,
       { typ: "werkzeug", kanal, werkzeug: name, eingabe, fehler, dauer_ms: Date.now() - start, ...wer });
     throw e;
   }
@@ -281,7 +289,7 @@ async function auftragsStatus(id: string) {
 // ------------------------------------------------------------ MCP
 
 function createServer(wer: Aufrufer) {
-  const server = new McpServer({ name: "random-mcp", version: "1.2.0" });
+  const server = new McpServer({ name: "random-mcp", version: "2.0.0" });
 
   const registriere = (
     name: WerkzeugName,
@@ -433,6 +441,8 @@ function createServer(wer: Aufrufer) {
 
 // ------------------------------------------------------------ REST
 
+const escapeHtml = (v: string) => v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, OPTIONS"
@@ -507,7 +517,8 @@ button:hover{border-color:var(--accent)}button b{display:block}button span{color
 .url{font:13px ui-monospace,monospace;color:var(--accent);word-break:break-all}pre{margin:8px 0 0;font:14px ui-monospace,monospace;white-space:pre-wrap}
 </style></head><body><main>
 <h1>random-mcp</h1>
-<p>Echte Zufallszahlen für LLMs per MCP (<code>/mcp</code>) – und hier dieselben Funktionen per REST.</p>
+<p>Echte Zufallszahlen für LLMs per MCP (<code>/mcp</code>) – und hier dieselben Funktionen per REST.<br>
+Angemeldet als <strong>__NUTZER__</strong> · <a href="/logout" style="color:var(--accent)">Abmelden</a></p>
 <div class="grid">
 <button data-u="/api/wuerfeln?anzahl=2"><b>🎲 2 Würfel</b><span>/api/wuerfeln?anzahl=2</span></button>
 <button data-u="/api/muenzwurf"><b>🪙 Münzwurf</b><span>/api/muenzwurf</span></button>
@@ -545,27 +556,57 @@ document.querySelectorAll('button[data-u]').forEach(b=>b.onclick=async()=>{
 
 // ------------------------------------------------------------ Worker-Einstieg
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const wer = aufrufer(request);
-
-    if (url.pathname === "/") {
-      return new Response(DEMO_SEITE, { headers: { "content-type": "text/html; charset=utf-8" } });
+/** MCP-Endpunkt: nur mit gültigem Token erreichbar (prüft der OAuthProvider). */
+const mcpHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext<Nutzer>) {
+    const nutzer = ctx.props;
+    // Autorisierung bei jedem Aufruf: wer von der Freigabeliste gestrichen wird, ist sofort draußen.
+    if (!istErlaubt(env, nutzer?.email)) {
+      protokoll(`[auth] Token von nicht (mehr) freigegebenem Konto: ${nutzer?.email}`, { typ: "auth", ergebnis: "abgelehnt", email: nutzer?.email ?? null });
+      return json({ fehler: "Dieses Konto ist nicht (mehr) freigegeben" }, 403);
     }
+    const wer = aufrufer(request, nutzer.email);
+    await protokolliereMcpAnfrage(request, wer);
+    return createMcpHandler(() => createServer(wer))(request, env, ctx);
+  }
+};
 
-    if (url.pathname === "/api" || url.pathname === "/api/") {
-      return json({
-        werkzeuge: [...Object.keys(WERKZEUGE), "auftrag_starten", "auftrag_status"],
-        beispiel: `${url.origin}/api/wuerfeln?anzahl=2&seiten=6`
+/** Alles andere: Anmeldung, Demo-Seite, REST-API. */
+const standardHandler = {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const p = url.pathname;
+
+    // --- Anmeldung
+    if (p === "/authorize") return authorize(request, env);
+    if (p === "/callback") return callback(request, env, protokoll);
+    if (p === "/login") return login(request, env);
+    if (p === "/login/callback") return loginCallback(request, env, protokoll);
+    if (p === "/logout") return logout();
+
+    // --- ab hier nur für angemeldete, freigegebene Browser-Nutzer
+    const nutzer = await webNutzer(request, env);
+
+    if (p === "/") {
+      if (!nutzer) return loginSeite();
+      return new Response(DEMO_SEITE.replace("__NUTZER__", escapeHtml(nutzer.email)), {
+        headers: { "content-type": "text/html; charset=utf-8" }
       });
     }
 
-    if (url.pathname.startsWith("/api/")) {
+    if (p === "/api" || p.startsWith("/api/")) {
       if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
+      if (!nutzer) return json({ fehler: "Nicht angemeldet", anmelden: `${url.origin}/login` }, 401);
+      const wer = aufrufer(request, nutzer.email);
+      if (p === "/api" || p === "/api/") {
+        return json({
+          werkzeuge: [...Object.keys(WERKZEUGE), "auftrag_starten", "auftrag_status"],
+          beispiel: `${url.origin}/api/wuerfeln?anzahl=2&seiten=6`
+        });
+      }
       if (request.method !== "GET") return json({ fehler: "Nur GET wird unterstützt" }, 405);
       try {
-        const name = url.pathname.slice(5);
+        const name = p.slice(5);
         const q = url.searchParams;
         if (name === "auftrag_starten") {
           const dauer = zahl(q, "dauer_sekunden", 30);
@@ -587,11 +628,40 @@ export default {
       }
     }
 
-    if (url.pathname.startsWith("/mcp")) {
-      await protokolliereMcpAnfrage(request, wer);
-      return createMcpHandler(() => createServer(wer))(request, env, ctx);
-    }
-
     return json({ fehler: "Nicht gefunden", endpunkte: ["/", "/api", "/mcp"] }, 404);
   }
-} satisfies ExportedHandler;
+};
+
+// Der OAuthProvider braucht die eigene Adresse (für Token-Zielgruppe und Discovery).
+// Damit es lokal (localhost) und bei Cloudflare gleichermaßen klappt, je Adresse einen erzeugen.
+const provider = new Map<string, OAuthProvider<Env>>();
+
+function oauthProvider(origin: string) {
+  let p = provider.get(origin);
+  if (!p) {
+    p = new OAuthProvider<Env>({
+      apiRoute: "/mcp",
+      apiHandler: mcpHandler as any,
+      defaultHandler: standardHandler as any,
+      authorizeEndpoint: "/authorize",
+      tokenEndpoint: "/token",
+      clientRegistrationEndpoint: "/register", // dynamische Registrierung (DCR) für ältere Clients
+      clientIdMetadataDocumentEnabled: true, // neueres Verfahren (CIMD)
+      scopesSupported: ["zufall", "offline_access"],
+      requiredScopes: ["zufall"],
+      resourceMetadata: {
+        resource: `${origin}/mcp`,
+        authorization_servers: [origin],
+        resource_name: "random-mcp"
+      } as any
+    });
+    provider.set(origin, p);
+  }
+  return p;
+}
+
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return oauthProvider(new URL(request.url).origin).fetch(request, env, ctx);
+  }
+} satisfies ExportedHandler<Env>;
