@@ -350,7 +350,7 @@ function createServer(wer: Aufrufer) {
       const start = Date.now();
       const token = ctx.mcpReq._meta?.progressToken;
       const schritte = 10;
-      protokoll(`[mcp] langsame_zufallszahl gestartet (${dauer_sekunden}s, Fortschritt ${token !== undefined ? "an" : "aus"})`,
+      protokoll(`[mcp] ${wer.nutzer ?? "?"}: langsame_zufallszahl gestartet (${dauer_sekunden}s, Fortschritt ${token !== undefined ? "an" : "aus"})`,
         { typ: "langsam", eingabe: { minimum, maximum, dauer_sekunden }, fortschritt_token: token ?? null, ...wer });
 
       for (let i = 0; i < schritte; i++) {
@@ -366,7 +366,7 @@ function createServer(wer: Aufrufer) {
 
       const zahl = zufallsInts(1, minimum, maximum)[0];
       const ergebnis = { zahl, dauer_sekunden: Math.round((Date.now() - start) / 1000), quelle: "fake-langsam (Demo, Cloudflare-Zufall)" };
-      protokoll(`[mcp] langsame_zufallszahl → ${zahl} nach ${ergebnis.dauer_sekunden}s`,
+      protokoll(`[mcp] ${wer.nutzer ?? "?"}: langsame_zufallszahl → ${zahl} nach ${ergebnis.dauer_sekunden}s`,
         { typ: "langsam", ergebnis, ...wer });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }],
@@ -397,7 +397,7 @@ function createServer(wer: Aufrufer) {
         geschaetzte_dauer_sekunden: dauer_sekunden,
         naechster_schritt: "auftrag_status mit dieser auftrag_id aufrufen (z. B. mit warten_sekunden=10)"
       };
-      protokoll(`[mcp] auftrag_starten (${minimum}–${maximum}, ${dauer_sekunden}s)`,
+      protokoll(`[mcp] ${wer.nutzer ?? "?"}: auftrag_starten (${minimum}–${maximum}, ${dauer_sekunden}s)`,
         { typ: "auftrag", eingabe: { minimum, maximum, dauer_sekunden }, auftrag_id, ...wer });
       return { content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }], structuredContent: ergebnis };
     }
@@ -430,7 +430,7 @@ function createServer(wer: Aufrufer) {
         await schlafe(Math.min(2000, Math.max(0, ende - Date.now())), ctx.mcpReq.signal);
       }
       const ergebnis = await auftragsStatus(auftrag_id);
-      protokoll(`[mcp] auftrag_status → ${ergebnis.status === "fertig" ? `fertig: ${ergebnis.zahl}` : `${ergebnis.fortschritt_prozent} % (${ergebnis.meldung})`}`,
+      protokoll(`[mcp] ${wer.nutzer ?? "?"}: auftrag_status → ${ergebnis.status === "fertig" ? `fertig: ${ergebnis.zahl}` : `${ergebnis.fortschritt_prozent} % (${ergebnis.meldung})`}`,
         { typ: "auftrag", ergebnis, ...wer });
       return { content: [{ type: "text" as const, text: JSON.stringify(ergebnis, null, 2) }], structuredContent: ergebnis };
     }
@@ -612,14 +612,14 @@ const standardHandler = {
           const dauer = zahl(q, "dauer_sekunden", 30);
           if (dauer < 5 || dauer > 180) throw new Error("dauer_sekunden muss zwischen 5 und 180 liegen");
           const auftrag_id = neuerAuftrag(zahl(q, "minimum", 1), zahl(q, "maximum", 100), dauer);
-          protokoll(`[rest] auftrag_starten (${dauer}s)`, { typ: "auftrag", kanal: "rest", auftrag_id, ...wer });
+          protokoll(`[rest] ${wer.nutzer ?? "?"}: auftrag_starten (${dauer}s)`, { typ: "auftrag", kanal: "rest", auftrag_id, ...wer });
           return json({ auftrag_id, status: "gestartet", geschaetzte_dauer_sekunden: dauer,
             status_url: `${url.origin}/api/auftrag_status?id=${auftrag_id}` });
         }
         if (name === "auftrag_status") {
           const ergebnis = await auftragsStatus(q.get("id") ?? "");
           if (ergebnis.status === "fertig")
-            protokoll(`[rest] auftrag_status → fertig: ${ergebnis.zahl}`, { typ: "auftrag", kanal: "rest", ergebnis, ...wer });
+            protokoll(`[rest] ${wer.nutzer ?? "?"}: auftrag_status → fertig: ${ergebnis.zahl}`, { typ: "auftrag", kanal: "rest", ergebnis, ...wer });
           return json(ergebnis);
         }
         return restAufruf(name, q, wer);
